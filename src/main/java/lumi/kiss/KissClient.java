@@ -28,6 +28,12 @@ public class KissClient implements ClientModInitializer {
     private static String prefix = "";
     private static long windowMs = 30000;
     private static boolean countDisappear = true;
+    private static boolean deathEnabled = false;
+    private static String[] deathMessages = {"{player} отправилась на респавн"};
+    private static boolean wasDead = false;
+    private static Object lastPlayer = null;
+    private static Object lastWorld = null;
+    private static Vec3d lastMyPos = null;
 
     private static class Hit {
         long time;
@@ -55,14 +61,38 @@ public class KissClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (!enabled || client.player == null || client.world == null) {
                 hits.clear();
+                wasDead = false;
                 return;
             }
 
-            // Если умер ты сам - ничего не пишем
+            // Респавн, смена мира или резкая телепортация тебя самой: старые удары сбрасываем,
+            // иначе пропажа соперника после ТВОЕЙ смерти будет принята за убийство
+            if (client.player != lastPlayer || client.world != lastWorld) {
+                hits.clear();
+                lastPlayer = client.player;
+                lastWorld = client.world;
+                lastMyPos = null;
+            }
+            Vec3d myPos = client.player.getPos();
+            if (lastMyPos != null && lastMyPos.squaredDistanceTo(myPos) > 100) {
+                hits.clear();
+            }
+            lastMyPos = myPos;
+
+            // Если умерла ты сама: убийства не считаем, но пишем сообщение о своей смерти (один раз)
             if (client.player.getHealth() <= 0 || client.player.isDead()) {
                 hits.clear();
+                if (!wasDead) {
+                    wasDead = true;
+                    if (deathEnabled) {
+                        String t = deathMessages[ThreadLocalRandom.current().nextInt(deathMessages.length)].trim();
+                        client.player.networkHandler.sendChatMessage(
+                                prefix + t.replace("{player}", client.player.getName().getString()));
+                    }
+                }
                 return;
             }
+            wasDead = false;
 
             long now = System.currentTimeMillis();
             Iterator<Map.Entry<UUID, Hit>> it = hits.entrySet().iterator();
@@ -120,7 +150,11 @@ public class KissClient implements ClientModInitializer {
                         "# Сколько секунд после удара убийство засчитывается тебе\n" +
                         "window_seconds=30\n" +
                         "# Считать убийством, если игрок внезапно пропал рядом после удара (true/false)\n" +
-                        "count_disappear=true\n";
+                        "count_disappear=true\n" +
+                        "# Писать сообщение, когда умираешь ты сама (true/false)\n" +
+                        "death_enabled=false\n" +
+                        "# Сообщение о твоей смерти. {player} - твой ник. Несколько вариантов через |\n" +
+                        "death_message={player} отправилась на респавн\n";
                 Files.writeString(file, def, StandardCharsets.UTF_8);
             }
             Properties p = new Properties();
@@ -132,6 +166,8 @@ public class KissClient implements ClientModInitializer {
             prefix = p.getProperty("prefix", "");
             windowMs = Long.parseLong(p.getProperty("window_seconds", "30").trim()) * 1000L;
             countDisappear = Boolean.parseBoolean(p.getProperty("count_disappear", "true").trim());
+            deathEnabled = Boolean.parseBoolean(p.getProperty("death_enabled", "false").trim());
+            deathMessages = p.getProperty("death_message", deathMessages[0]).split("\\|");
         } catch (IOException | NumberFormatException ex) {
             // оставляем значения по умолчанию
         }
