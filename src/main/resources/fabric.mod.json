@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "kissmod",
+  "version": "${version}",
+  "name": "Kiss Kill Message",
+  "description": "Пишет в чат сообщение, когда ты убиваешь игрока",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["lumi.kiss.KissClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.4",
+    "fabric-api": "*"
+  }
+}
