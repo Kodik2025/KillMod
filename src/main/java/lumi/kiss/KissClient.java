@@ -5,7 +5,10 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.projectile.ProjectileEntity;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.math.Vec3d;
 
@@ -28,6 +31,9 @@ public class KissClient implements ClientModInitializer {
     private static String prefix = "";
     private static long windowMs = 30000;
     private static boolean countDisappear = true;
+    private static float disappearMaxHealth = 12f;
+    private static long disappearWindowMs = 5000;
+    private static long damageWindowMs = 3000;
     private static boolean deathEnabled = false;
     private static String[] deathMessages = {"{player} отправилась на респавн"};
     private static boolean wasDead = false;
@@ -39,9 +45,13 @@ public class KissClient implements ClientModInitializer {
         long time;
         String name;
         Vec3d lastPos;
+        float lastHealth = 20f;
+        boolean damaged = false;
+        long lastDamageTime = 0;
     }
 
     private static final Map<UUID, Hit> hits = new HashMap<>();
+    private static final Map<UUID, Long> pearlThrowers = new HashMap<>();
 
     @Override
     public void onInitializeClient() {
@@ -49,10 +59,16 @@ public class KissClient implements ClientModInitializer {
 
         AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
             if (enabled && world.isClient && entity instanceof PlayerEntity p && p != player) {
+                Hit old = hits.get(p.getUuid());
                 Hit h = new Hit();
                 h.time = System.currentTimeMillis();
                 h.name = p.getName().getString();
                 h.lastPos = p.getPos();
+                h.lastHealth = p.getHealth();
+                if (old != null) {
+                    h.damaged = old.damaged;
+                    h.lastDamageTime = old.lastDamageTime;
+                }
                 hits.put(p.getUuid(), h);
             }
             return ActionResult.PASS;
@@ -65,8 +81,7 @@ public class KissClient implements ClientModInitializer {
                 return;
             }
 
-            // Респавн, смена мира или резкая телепортация тебя самой: старые удары сбрасываем,
-            // иначе пропажа соперника после ТВОЕЙ смерти будет принята за убийство
+            // Респавн, смена мира или резкая телепортация тебя самой: сбрасываем удары
             if (client.player != lastPlayer || client.world != lastWorld) {
                 hits.clear();
                 lastPlayer = client.player;
@@ -79,7 +94,7 @@ public class KissClient implements ClientModInitializer {
             }
             lastMyPos = myPos;
 
-            // Если умерла ты сама: убийства не считаем, но пишем сообщение о своей смерти (один раз)
+            // Если умерла ты сама: убийства не считаем
             if (client.player.getHealth() <= 0 || client.player.isDead()) {
                 hits.clear();
                 if (!wasDead) {
@@ -95,6 +110,16 @@ public class KissClient implements ClientModInitializer {
             wasDead = false;
 
             long now = System.currentTimeMillis();
+
+            // Запоминаем тех, кто бросил жемчуг (их пропажа - телепорт, а не смерть)
+            for (Entity ent : client.world.getEntities()) {
+                if (ent.getType() == EntityType.ENDER_PEARL
+                        && ent instanceof ProjectileEntity pe && pe.getOwner() != null) {
+                    pearlThrowers.put(pe.getOwner().getUuid(), now);
+                }
+            }
+            pearlThrowers.values().removeIf(t -> now - t > 60000);
+
             Iterator<Map.Entry<UUID, Hit>> it = hits.entrySet().iterator();
             while (it.hasNext()) {
                 Map.Entry<UUID, Hit> e = it.next();
@@ -108,8 +133,16 @@ public class KissClient implements ClientModInitializer {
                 PlayerEntity victim = client.world.getPlayerByUuid(e.getKey());
 
                 if (victim == null) {
-                    // Игрок пропал из мира: если был рядом (до 12 блоков), считаем убийством
-                    if (countDisappear && h.lastPos != null
+                    // Игрок пропал из мира. Убийство, только если ему реально нанесли урон
+                    // незадолго до этого, у него было мало здоровья и он не кидал жемчуг.
+                    Long pearlTime = pearlThrowers.get(e.getKey());
+                    boolean threwPearl = pearlTime != null && now - pearlTime < 15000;
+                    if (countDisappear && !threwPearl
+                            && h.damaged
+                            && now - h.lastDamageTime <= damageWindowMs
+                            && h.lastHealth <= disappearMaxHealth
+                            && now - h.time <= disappearWindowMs
+                            && h.lastPos != null
                             && h.lastPos.squaredDistanceTo(client.player.getPos()) < 144) {
                         send(client, h.name);
                     }
@@ -119,7 +152,15 @@ public class KissClient implements ClientModInitializer {
 
                 h.lastPos = victim.getPos();
 
-                if (victim.getHealth() <= 0 || victim.isDead()) {
+                // Урон засчитан, если здоровье упало или у игрока идёт анимация получения урона
+                float hp = victim.getHealth();
+                if (hp < h.lastHealth - 0.01f || victim.hurtTime > 0) {
+                    h.damaged = true;
+                    h.lastDamageTime = now;
+                }
+                h.lastHealth = hp;
+
+                if (hp <= 0 || victim.isDead()) {
                     send(client, victim.getName().getString());
                     it.remove();
                 }
@@ -149,8 +190,10 @@ public class KissClient implements ClientModInitializer {
                         "prefix=\n" +
                         "# Сколько секунд после удара убийство засчитывается тебе\n" +
                         "window_seconds=30\n" +
-                        "# Считать убийством, если игрок внезапно пропал рядом после удара (true/false)\n" +
+                        "# Считать убийством, если игрок пропал после полученного урона (true/false)\n" +
                         "count_disappear=true\n" +
+                        "# Пропажа считается убийством, только если у игрока было не больше столько здоровья (20 = 10 сердец)\n" +
+                        "disappear_max_health=12\n" +
                         "# Писать сообщение, когда умираешь ты сама (true/false)\n" +
                         "death_enabled=false\n" +
                         "# Сообщение о твоей смерти. {player} - твой ник. Несколько вариантов через |\n" +
@@ -166,6 +209,7 @@ public class KissClient implements ClientModInitializer {
             prefix = p.getProperty("prefix", "");
             windowMs = Long.parseLong(p.getProperty("window_seconds", "30").trim()) * 1000L;
             countDisappear = Boolean.parseBoolean(p.getProperty("count_disappear", "true").trim());
+            disappearMaxHealth = Float.parseFloat(p.getProperty("disappear_max_health", "12").trim());
             deathEnabled = Boolean.parseBoolean(p.getProperty("death_enabled", "false").trim());
             deathMessages = p.getProperty("death_message", deathMessages[0]).split("\\|");
         } catch (IOException | NumberFormatException ex) {
